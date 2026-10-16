@@ -14,7 +14,8 @@ image-level patches that the vLLM version string cannot see. A snapshot is used
 only when its key matches exactly and it covers every tensor of the model;
 otherwise the rank loads normally and writes a new one. Names start with
 SNAPSHOT_VERSION, and opening the directory deletes snapshots of any other
-version.
+version. The manifest also records a fingerprint of the checkpoint's tensor
+bytes (#62): a snapshot written from other bytes is a miss (see complete()).
 """
 import hashlib
 import json
@@ -39,6 +40,40 @@ _SNAPSHOT_NAME = re.compile(r"(v\d+-)?(target|draft)-tp\d+of\d+-dp\d+-[0-9a-f]{1
 
 _ALIGN = 4096
 _CHUNK = 64 << 20  # bytes per read; two pinned buffers of this size
+_SAMPLE = 1 << 20  # bytes read at each of three points of every shard
+
+
+def _content_fingerprint(model: str) -> str | None:
+    """Hash of sampled tensor bytes and the size of every safetensors shard.
+
+    vLLM's checkpoint hash covers only the shard headers, so an in-place update
+    to a revision with the same tensor names, shapes and dtypes (DFlash2
+    7d74cdd -> bf582e4) keeps the key and restores the old weights (#62). This
+    reads 1 MiB at the start, middle and end of each shard's data, so a change
+    confined to tensors between the samples is still missed. vLLM #59648 is
+    the upstream fix. None for a repo id that is not a local directory, like
+    vLLM's hash.
+    """
+    if not os.path.isdir(model):
+        return None
+    shards = sorted(f for f in os.listdir(model) if f.endswith(".safetensors"))
+    if not shards:
+        return None
+    h = hashlib.sha256()
+    for name in shards:
+        path = os.path.join(model, name)
+        size = os.path.getsize(path)
+        h.update(f"{name}:{size}".encode())
+        with open(path, "rb") as f:
+            start = 8 + int.from_bytes(f.read(8), "little")
+            span = max(size - start - _SAMPLE, 0)
+            for off in (start, start + span // 2, start + span):
+                f.seek(off)
+                h.update(f.read(_SAMPLE))
+            # Leave no page cache behind: on GB10 it competes with CUDA.
+            if hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    return h.hexdigest()
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -46,9 +81,13 @@ def _dtype(name: str) -> torch.dtype:
 
 
 class Snapshot:
-    def __init__(self, path: str, key: dict):
+    def __init__(self, path: str, key: dict, content: str | None = None, role: str = "target"):
         self.path = path
         self.key = key
+        # Not in the key: a new field there would rename, and so rewrite, every
+        # existing snapshot. complete() compares it with the manifest instead.
+        self.content = content
+        self.role = role
 
     # ---- key ----------------------------------------------------------------
 
@@ -93,10 +132,48 @@ class Snapshot:
         role = "draft" if is_draft else "target"
         name = f"v{SNAPSHOT_VERSION}-{role}-tp{key['tp_rank']}of{key['tp_size']}-dp{key['dp_rank']}-{digest}"
         _remove_other_versions(base)
-        return cls(os.path.join(base, name), key)
+        return cls(os.path.join(base, name), key, _content_fingerprint(model_config.model), role)
 
     def complete(self) -> bool:
-        return os.path.isfile(os.path.join(self.path, "COMPLETE"))
+        """A finished snapshot of these checkpoint bytes.
+
+        The key covers the shard headers. The manifest also holds a fingerprint
+        of the tensor bytes, so a same-shape checkpoint update (#62) is a miss
+        here: the rank loads normally and rewrites this one snapshot. A snapshot
+        written before the field existed: a draft one is a miss (where #62
+        happened; about 1.4 GiB a rank to rewrite), a target one is accepted and
+        gets the field, so nothing large is rewritten. A target checkpoint
+        changed in place before that boot goes unseen: delete its snapshots.
+        """
+        if not os.path.isfile(os.path.join(self.path, "COMPLETE")):
+            return False
+        if self.content is None:  # not a local directory: nothing to compare, as with vLLM's hash
+            return True
+        mpath = os.path.join(self.path, "manifest.json")
+        try:
+            with open(mpath) as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            return False
+        have = manifest.get("content")
+        if have == self.content:
+            return True
+        if have is not None:
+            logger.info("Weight snapshot: %s holds other checkpoint bytes; loading normally and rewriting it", self.path)
+            return False
+        if self.role == "draft":
+            logger.info("Weight snapshot: %s predates content fingerprints; rewriting this draft snapshot once", self.path)
+            return False
+        manifest["content"] = self.content
+        tmp = mpath + f".tmp{os.getpid()}"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(manifest, f)
+            os.replace(tmp, mpath)
+            logger.info("Weight snapshot: recorded the content fingerprint in %s", mpath)
+        except OSError as e:
+            logger.warning("Weight snapshot: could not record the content fingerprint in %s: %s", mpath, e)
+        return True
 
     # ---- save ---------------------------------------------------------------
 
@@ -130,7 +207,7 @@ class Snapshot:
                 entries.append({"path": path, "dtype": str(t.dtype), "shape": list(t.shape),
                                 "offset": offset, "nbytes": nbytes})
                 offset += nbytes + pad
-        manifest = {"key": self.key, "entries": entries, "aliases": aliases,
+        manifest = {"key": self.key, "content": self.content, "entries": entries, "aliases": aliases,
                     "module_attrs": _module_flags(model), "bytes": offset}
         with open(os.path.join(tmp, "manifest.json"), "w") as f:
             json.dump(manifest, f)
