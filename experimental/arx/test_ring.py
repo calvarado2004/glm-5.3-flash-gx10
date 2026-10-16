@@ -5,12 +5,22 @@ Every rank builds every rank's inputs from fixed seeds and computes the
 result the way the kernels do (bf16 values summed in fp32 in rank order,
 rounded once). Each collective's output must match that reference bit for
 bit, and each rank's output must match what the other ranks expect it to
-hold. Covered: the arx all-reduce, arxbig's all_gather and reduce_scatter,
-and the fused MoE finalize + rs_finish path (with routing weights that are
-powers of two, so the reference can round the same way the kernel's FMAs
-do). Calls also go out in back-to-back bursts of mixed collectives, checked
-only afterwards, so buffer reuse and relays run at full speed. It then
-prints all-reduce latency and all-gather / reduce-scatter bandwidth.
+hold. Covered: the arx all-reduce, arx's two-shot all-reduce (mesh only),
+arxbig's all_gather and reduce_scatter, and the fused MoE finalize +
+rs_finish path (with routing weights that are powers of two, so the
+reference can round the same way the kernel's FMAs do). The two-shot sizes
+are prefill steps of 33 to 255 tokens at hidden 4096 that are not multiples
+of 8: there the scatter's blocks read parts of the send buffer other blocks
+copied, which is where a missing wait shows. Calls also go out in
+back-to-back bursts of mixed collectives, checked only afterwards, so buffer
+reuse and relays run at full speed. It then prints all-reduce latency and
+all-gather / reduce-scatter bandwidth.
+
+--slow-copy-us N (mesh only) checks the two-shot sizes alone, with rank 1
+built with test hooks: block 1 of its two-shot copy sleeps N us before it
+copies its share of the input. The scatter's other blocks then reach those
+elements first, so a scatter that does not wait for this rank's own publish
+reads last parity's data and fails every size. 20000 is plenty.
 
 Mesh mode needs every box on the switch; ring mode needs the ring cabling,
 or the switch with both ARX_RING_*_HCAS set to the NCCL_IB_HCA devices (that
@@ -34,7 +44,9 @@ with FABRIC, for mesh, the entrypoint's values (its log prints them):
 and for ring, the two functions of the port facing each neighbour, e.g.
     -e ARX_RING_PREV_HCAS=rocep1s0f0,roceP2p1s0f0 -e ARX_RING_NEXT_HCAS=rocep1s0f1,roceP2p1s0f1
 
-The /tmp/arx-ext mount keeps the compiled extensions between runs.
+The /tmp/arx-ext mount keeps the compiled extensions between runs. Give each
+version of the code its own: ninja rebuilds only when a source is newer than
+its build, so a copied older source reuses the other version's build.
 WORLD_SIZE=2 works the same way. At WORLD_SIZE=3 ring mode is arx only:
 arxbig refuses a ring of 3, so this script stops at its setup. Every rank
 prints its failures and rank 0 ends with "RESULT <mode>: PASS" or "FAIL";
@@ -55,6 +67,10 @@ import torch
 import torch.distributed as dist
 
 BF16 = torch.bfloat16
+HIDDEN = 4096
+# Two-shot step sizes in tokens: none a multiple of 8, so the scatter's chunk
+# never lines up with the copy's stride.
+TWO_SHOT_TOKENS = (33, 57, 65, 89, 95, 97, 127, 161, 199, 255)
 
 
 def lan_iface(ip: str) -> str:
@@ -118,6 +134,7 @@ class Test:
         self.big = arx.ArxBig(dist.group.WORLD, dev)
         if self.ar.disabled or self.big.disabled or not self.big.rs:
             sys.exit("arx or arxbig did not come up; see the warnings above")
+        self.two_shot = self.ar.ext.max_bytes2() > 0  # mesh only
         self.dog = Watchdog(self.rank, 120)  # after the extensions compile
 
     # Each op issues one collective and returns (output, reference function,
@@ -128,6 +145,12 @@ class Test:
         ins = [gen((n,), BF16, "ar", key, s) for s in range(self.world)]
         out = torch.empty_like(ins[self.rank])
         self.ar.ext.allreduce(ins[self.rank], out, [], [])
+        return out, lambda: rank_order_sum(ins), "same"
+
+    def allreduce2(self, n: int, key):
+        ins = [gen((n,), BF16, "ar2", key, s) for s in range(self.world)]
+        out = torch.empty_like(ins[self.rank])
+        self.ar.ext.allreduce2(ins[self.rank], out)
         return out, lambda: rank_order_sum(ins), "same"
 
     def all_gather(self, nbytes: int, dtype, key):
@@ -200,6 +223,8 @@ class Test:
     def issue(self, op: str, size: int, key):
         if op == "ar":
             return self.allreduce(size // 2, key)
+        if op == "ar2":
+            return self.allreduce2(size // 2, key)
         if op == "ag":
             return self.all_gather(size, BF16, key)
         if op == "ag8":
@@ -244,6 +269,8 @@ def main():
     p.add_argument("--mode", choices=["mesh", "ring"], required=True)
     p.add_argument("--repeat", type=int, default=3, help="checks per size")
     p.add_argument("--bursts", type=int, default=20, help="bursts of 16 mixed collectives")
+    p.add_argument("--slow-copy-us", type=int, default=0,
+                   help="check the two-shot sizes only, with rank 1's copy block 1 held back this long")
     args = p.parse_args()
 
     os.environ["VLLM_ARX_RING"] = "1" if args.mode == "ring" else "0"
@@ -251,6 +278,8 @@ def main():
     if "GLOO_SOCKET_IFNAME" not in os.environ and "VLLM_HOST_IP" in os.environ:
         os.environ["GLOO_SOCKET_IFNAME"] = lan_iface(os.environ["VLLM_HOST_IP"])
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    if args.slow_copy_us and rank == 1:
+        os.environ["ARX_TEST_SLOW_COPY_US"] = str(args.slow_copy_us)
     torch.cuda.set_device(0)
     dist.init_process_group("gloo", init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
                             rank=rank, world_size=world)
@@ -260,10 +289,29 @@ def main():
     T = Test(args.mode)
     KB, MB = 1 << 10, 1 << 20
 
+    if args.slow_copy_us:
+        if not T.two_shot:
+            sys.exit("--slow-copy-us needs two-shot, which is mesh only")
+        T.say(f"checking two-shot sizes, rank 1's copy block 1 held back {args.slow_copy_us} us")
+        for tokens in TWO_SHOT_TOKENS:
+            for i in range(args.repeat):
+                T.check(f"allreduce2 {tokens} x {HIDDEN}, slow copy", *T.allreduce2(tokens * HIDDEN, ("slow", i)))
+        T.dog.at("result")
+        fails: list = [None] * world
+        dist.all_gather_object(fails, T.failures)
+        T.say(f"RESULT {args.mode} slow copy: {'PASS' if sum(fails) == 0 else 'FAIL'}: {T.checks} checks per rank, "
+              f"failures per rank {fails}")
+        dist.barrier()
+        os._exit(0 if sum(fails) == 0 else 1)
+
     T.say("checking sizes")
     for n in (8, 64, 1024, 4096, 32768, 131072, 262144):
         for i in range(args.repeat):
             T.check(f"allreduce {n * 2} B", *T.allreduce(n, ("size", i)))
+    if T.two_shot:
+        for tokens in TWO_SHOT_TOKENS:
+            for i in range(args.repeat):
+                T.check(f"allreduce2 {tokens} x {HIDDEN}", *T.allreduce2(tokens * HIDDEN, ("size", i)))
     for nbytes in (16, 48, 4 * KB, 1 * MB + 16, 8 * MB, 32 * MB):
         for i in range(args.repeat):
             T.check(f"all_gather {nbytes} B", *T.all_gather(nbytes, BF16, ("size", i)))
@@ -278,14 +326,19 @@ def main():
     T.say("checking bursts of mixed collectives")
     rng = random.Random(1234)  # the same sequence on every rank
     sizes = {"ar": [16, 8 * KB, 64 * KB, 512 * KB], "ag": [16, 64 * KB, 1 * MB, 4 * MB],
-             "ag8": [48, 1 * MB], "rs": [16, 64 * KB, 1 * MB, 4 * MB], "fin": [1 * MB, 8 * MB]}
+             "ag8": [48, 1 * MB], "rs": [16, 64 * KB, 1 * MB, 4 * MB], "fin": [1 * MB, 8 * MB],
+             "ar2": [t * HIDDEN * 2 for t in TWO_SHOT_TOKENS]}
+    kinds = ["ar", "ar", "ar", "ag", "ag8", "rs", "rs", "fin"] + (["ar2", "ar2"] if T.two_shot else [])
     for b in range(args.bursts):
         ops = []
         for _ in range(16):
-            op = rng.choice(["ar", "ar", "ar", "ag", "ag8", "rs", "rs", "fin"])
+            op = rng.choice(kinds)
             ops.append((op, rng.choice(sizes[op])))
         T.burst(f"burst{b}", ops)
     T.burst("allreduce x64", [("ar", 8 * KB)] * 64)
+    if T.two_shot:
+        T.burst("allreduce2 x40", [("ar2", s) for s in sizes["ar2"]] * 4)
+        T.burst("allreduce, allreduce2 x40", [op for s in sizes["ar2"] for op in (("ar", 8 * KB), ("ar2", s))] * 2)
     T.burst("reduce_scatter x8", [("rs", 8 * MB)] * 8)
     T.burst("finalize_rs x4", [("fin", 8 * MB)] * 4)
 
